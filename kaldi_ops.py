@@ -1,18 +1,12 @@
 import os
 from collections import namedtuple
-
 import tensorflow as tf
-import inspect
 
-current_dir = os.path.dirname(os.path.abspath(
-    inspect.getfile(inspect.currentframe())))
-
-base_dir = os.path.join(current_dir, 'user_ops')
 try:
-    _kaldi_module = tf.load_op_library(base_dir + '/libkaldi.so')
+    _kaldi_module = tf.load_op_library('user_ops/libkaldi.so')
 except tf.errors.NotFoundError as e:
     try:
-         _kaldi_module = tf.load_op_library(base_dir + '/libkaldi.dylib')
+        _kaldi_module = tf.load_op_library('user_ops/libkaldi.dylib')
     except:
         raise e
 
@@ -23,7 +17,8 @@ Decode = namedtuple(
 DecodeOptsBase = namedtuple(
     'DecodeOpts',
     ('acoustic_scale', 'beam', 'max_active', 'min_active', 'lattice_beam',
-     'prune_interval', 'beam_delta', 'hash_ratio', 'prune_scale', 'allow_partial')
+     'prune_interval', 'beam_delta', 'hash_ratio', 'prune_scale', 'allow_partial',
+     'lattice_ark_file')
 )
 class DecodeOpts(DecodeOptsBase):
     """
@@ -43,18 +38,26 @@ class DecodeOpts(DecodeOptsBase):
             the tokens as we go.
         allow_partial (bool): If true, produce output even if end state
             was not reached
+        lattice_ark_file (string): If specified, search graph will be stored
+            in this file.
     """
     __slots__ = ()
 
-default_DecodeOpts = DecodeOpts(
-    acoustic_scale=0.1, beam=10, max_active=2147483647, min_active=200,
-    lattice_beam=10, prune_interval=25, beam_delta=0.5, hash_ratio=2.0,
-    prune_scale=0.1, allow_partial=True
-)
+    def __new__(cls,
+            acoustic_scale=0.1, beam=10, max_active=2147483647, min_active=200,
+            lattice_beam=10, prune_interval=25, beam_delta=0.5, hash_ratio=2.0,
+            prune_scale=0.1, allow_partial=True, lattice_ark_file=''
+        ):
+        return super().__new__(cls,
+            acoustic_scale, beam, max_active, min_active,
+            lattice_beam, prune_interval, beam_delta, hash_ratio,
+            prune_scale, allow_partial, lattice_ark_file
+        )
+
 
 def decode(
         log_likelihoods, decode_fst_filename, model_filename,
-        decode_opts=default_DecodeOpts
+        decode_opts=DecodeOpts(), utt_id=''
     ):
     """ Decode given log likelihoods, a transition model and the HCLG graph.
 
@@ -69,8 +72,10 @@ def decode(
     assert os.path.isfile(decode_fst_filename)
     assert os.path.isfile(model_filename)
     assert log_likelihoods.get_shape().ndims == 2
+    if len(decode_opts.lattice_ark_file) and isinstance(utt_id, str):
+        assert len(utt_id)
     dec = _kaldi_module.decode(
-        log_likelihoods,
+        log_likelihoods, utt_id,
         decode_fst_filename, model_filename,
         *decode_opts
     )
@@ -95,10 +100,16 @@ class FbankOpts(FbankOptsBase):
         use_power (bool): Use power in filterbank analysis, else magnitude.
     """
     __slots__ = ()
-default_FbankOpts = FbankOpts(
-    use_energy=False, energy_floor=0.0, raw_energy=True, htk_compat=False,
-    use_log_fbank=True, use_power=True
-)
+
+    def __new__(cls,
+            use_energy=False, energy_floor=0.0, raw_energy=True,
+            htk_compat=False, use_log_fbank=True, use_power=True
+        ):
+        return super().__new__(cls,
+            use_energy, energy_floor, raw_energy, htk_compat,
+            use_log_fbank, use_power
+        )
+
 
 FrameOptsBase = namedtuple(
     'FrameOpts',
@@ -121,11 +132,17 @@ class FrameOpts(FrameOptsBase):
     """
     __slots__ = ()
 
-default_FrameOpts = FrameOpts(
-    frame_shift_ms=10.0, frame_length_ms=25.0, dither=1.0, preemph_coeff=0.97,
-    remove_dc_offset=True, window_type='povey', round_to_power_of_two=True,
-    blackman_coeff=0.42, snip_edges=True
-)
+    def __new__(cls,
+            frame_shift_ms=10.0, frame_length_ms=25.0, dither=1.0,
+            preemph_coeff=0.97, remove_dc_offset=True, window_type='povey',
+            round_to_power_of_two=True, blackman_coeff=0.42, snip_edges=True
+        ):
+        return super().__new__(cls,
+            frame_shift_ms, frame_length_ms, dither, preemph_coeff,
+            remove_dc_offset, window_type, round_to_power_of_two,
+            blackman_coeff, snip_edges
+        )
+
 
 MelOptsBase = namedtuple(
     'MelOpts',
@@ -143,14 +160,19 @@ class MelOpts(MelOptsBase):
             if negative, added to the Nyquist frequency to get the cutoff.
     """
     __slots__ = ()
-default_MelOpts = MelOpts(
-    num_bins=25, low_freq=20, high_freq=0, vtln_low=100, vtln_high=-500
-)
+
+    def __new__(cls,
+            num_bins=25, low_freq=20, high_freq=0, vtln_low=100, vtln_high=-500
+        ):
+        return super().__new__(cls,
+            num_bins, low_freq, high_freq, vtln_low, vtln_high
+        )
+
 
 def fbank(
-        wav_data, vtln_warp=tf.constant(1.0, dtype=tf.float32),
-        fbank_opts=default_FbankOpts, frame_opts=default_FrameOpts,
-        mel_opts=default_MelOpts
+        wav_data, vtln_warp=1.0,
+        fbank_opts=FbankOpts(), frame_opts=FrameOpts(),
+        mel_opts=MelOpts()
     ):
     """ Creates Mel-Filterbank features given raw audio data.
 
@@ -166,7 +188,7 @@ def fbank(
         scaled such that the highest value is max(int16)
 
     """
-
+    wav_data = tf.convert_to_tensor(wav_data)
     assert wav_data.shape.ndims == 1
     return _kaldi_module.fbank(
         wav_data, vtln_warp,
@@ -183,9 +205,11 @@ class DeltaOpts(DeltaOptsBase):
     """
     __slots__ = ()
 
-default_DeltaOpts = DeltaOpts(order=2, window=2)
+    def __new__(cls, order=2, window=2):
+        return super().__new__(cls, order, window)
 
-def add_deltas(features, delta_opts=default_DeltaOpts):
+
+def add_deltas(features, delta_opts=DeltaOpts()):
     """ Compute deltas of `features` according to `delta_opts`.
 
     Args:
@@ -193,7 +217,7 @@ def add_deltas(features, delta_opts=default_DeltaOpts):
         delta_opts (DeltaOpts): Options for the delta computation.
 
     """
-
+    features = tf.convert_to_tensor(features)
     assert features.shape.ndims == 2
     return _kaldi_module.add_deltas(features, *delta_opts)
 
@@ -208,13 +232,8 @@ def decode_wav(raw_data):
 
 
 def read_word_table(words_txt):
-    """ Reads the ID -> word mapping from `words.txt`
-
-    Args:
-        words_txt (str): Kaldi words.txt containing the mapping
-
-    """
     with open(words_txt) as fid:
-        return {int(line.strip().split(' ')[1]): line.split(' ')[0]
-                for line in fid
-                if len(line.split(' ')) == 2}
+        return {
+            int(line.strip().split(' ')[1]): line.split(' ')[0]
+            for line in fid if len(line.split(' ')) == 2
+        }
