@@ -220,7 +220,7 @@ def lstm(x, sequence_length, units, scope, initializer, reverse):
             )
         with tf.name_scope('input_transform'):
             x = normalize_3d(tf.einsum('tbf,fu->tbu', x, W_x), gamma, beta)
-        cell = rnn.CompiledWrapper(LSTMCell(units, W_h))
+        cell = LSTMCell(units, W_h)
         h, _ = tf.nn.dynamic_rnn(
             cell, x, time_major=True, dtype=x.dtype,
             sequence_length=sequence_length
