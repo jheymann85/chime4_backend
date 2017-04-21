@@ -64,7 +64,9 @@ REGISTER_OP("Decode")
     .Attr("hash_ratio: float")
     .Attr("prune_scale: float")
     .Attr("allow_partial: bool")
+    .Attr("lattice_ark_file: string")
     .Input("posteriors: float")
+    .Input("utt_id: string")
     .Output("decode_sequence: int32")
     .Output("alignment: int32")
     .Output("num_frames: int32")
@@ -94,11 +96,57 @@ class KaldiDecodeOp : public OpKernel {
         context->GetAttr("prune_scale", &_prune_scale));
       OP_REQUIRES_OK(context,
         context->GetAttr("allow_partial", &_allow_partial));
+      OP_REQUIRES_OK(context,
+        context->GetAttr("lattice_ark_file", &_lattice_ark_file)); 
 
       OP_REQUIRES_OK(context,
              context->GetAttr("fst_in_filename", &_fst_in_filename));
       OP_REQUIRES_OK(context,
              context->GetAttr("model_in_filename", &_model_in_filename));
+
+      _config.beam = _beam;
+      _config.max_active = _max_active;
+      _config.min_active = _min_active;
+      _config.lattice_beam = _lattice_beam;
+      _config.prune_interval = _prune_interval;
+      _config.beam_delta = _beam_delta;
+      _config.hash_ratio = _hash_ratio;
+      _config.prune_scale = _prune_scale;
+
+      
+ 
+      if (kaldi::ClassifyRspecifier(_fst_in_filename, NULL, NULL) == \
+        kaldi::kNoRspecifier) {
+        // Input FST is just one FST, not a table of FSTs.
+        try {
+          fst::ReadFstKaldi(_fst_in_filename, &_decode_fst);
+        } catch(...) {
+          std::stringstream msg;
+          msg << "Could not load decode fst " << _fst_in_filename;
+          OP_REQUIRES(context, false, errors::Internal(msg.str()));
+        }
+      } else {
+          OP_REQUIRES(
+              context, false,
+              errors::Internal("Only one FST is supported for now")
+          );
+      }
+
+      try {
+        kaldi::ReadKaldiObject(_model_in_filename, &_trans_model);
+      } catch(...) {
+        std::stringstream msg;
+        msg << "Could not load transition model " << _model_in_filename;
+        OP_REQUIRES(context, false, errors::Internal(msg.str()));
+      }
+      _lattice_ark_file = "ark:" + _lattice_ark_file;
+      if (!_lattice_ark_file.empty()) {
+        if (!_compact_lattice_writer.Open(_lattice_ark_file))
+        {
+          KALDI_ERR << "Could not open table for writing lattices: "
+                    << _lattice_ark_file;
+        }
+      }
   }
 
   void Compute(OpKernelContext* context) override {
@@ -108,46 +156,12 @@ class KaldiDecodeOp : public OpKernel {
     kaldi::Matrix<kaldi::BaseFloat>* loglikes = \
       MatrixFromTensor<kaldi::BaseFloat>(tf_posteriors);
     
-    kaldi::TransitionModel trans_model;
-    try {
-      kaldi::ReadKaldiObject(_model_in_filename, &trans_model);
-    } catch(...) {
-      std::stringstream msg;
-      msg << "Could not load transition model " << _model_in_filename;
-      OP_REQUIRES(context, false, errors::Internal(msg.str()));
-    }
-    kaldi::LatticeFasterDecoderConfig config = kaldi::LatticeFasterDecoderConfig();
-    config.beam = _beam;
-    config.max_active = _max_active;
-    config.min_active = _min_active;
-    config.lattice_beam = _lattice_beam;
-    config.prune_interval = _prune_interval;
-    config.beam_delta = _beam_delta;
-    config.hash_ratio = _hash_ratio;
-    config.prune_scale = _prune_scale;
-
-    fst::VectorFst<fst::StdArc> *decode_fst = NULL;
-    if (kaldi::ClassifyRspecifier(_fst_in_filename, NULL, NULL) == \
-      kaldi::kNoRspecifier) {
-      // Input FST is just one FST, not a table of FSTs.
-      try {
-        decode_fst = fst::ReadFstKaldi(_fst_in_filename);
-      } catch(...) {
-        std::stringstream msg;
-        msg << "Could not load decode fst " << _fst_in_filename;
-        OP_REQUIRES(context, false, errors::Internal(msg.str()));
-      }
-    } else {
-        OP_REQUIRES(
-            context, false,
-            errors::Internal("Only one FST is supported for now")
-        );
-    }
-    kaldi::LatticeFasterDecoder decoder(*decode_fst, config);
     kaldi::DecodableMatrixScaledMapped decodable(
-      trans_model, _acoustic_scale, loglikes
+      _trans_model, _acoustic_scale, loglikes
     );
+    kaldi::LatticeFasterDecoder decoder(_decode_fst, _config);
 
+    // Decode
     bool success = false;
     bool partial = false;
     std::string msg;
@@ -169,22 +183,53 @@ class KaldiDecodeOp : public OpKernel {
     }
     OP_REQUIRES(context, success, errors::Internal(msg));
     
+    // Get Best Path
     double likelihood;
     kaldi::LatticeWeight weight;
-
+    std::vector<int32> alignment;
+    std::vector<int32> words;
     fst::VectorFst<kaldi::LatticeArc> decoded;
     decoder.GetBestPath(&decoded);
     if (decoded.NumStates() == 0) {
         // Shouldn't really reach this point as already checked success.
         KALDI_ERR << "Failed to get traceback for utterance ";
     }
-    std::vector<int32> alignment;
-    std::vector<int32> words;
     GetLinearSymbolSequence(decoded, &alignment, &words, &weight);
     int32 num_frames = alignment.size();
     likelihood = -(weight.Value1() + weight.Value2());
 
-    // Create an output tensor
+    // Optional: write lattice
+    if (!_lattice_ark_file.empty()) {
+      std::string utt_ = context->input(1).flat<string>()(0);
+      kaldi::Lattice *lat_ = new kaldi::Lattice;
+      decoder.GetRawLattice(lat_);
+      if (lat_->NumStates() == 0)
+        KALDI_ERR << "Unexpected problem getting lattice for utterance " << utt_;
+      fst::Connect(lat_);
+      kaldi::CompactLattice *clat_ = new kaldi::CompactLattice;
+      if (!fst::DeterminizeLatticePhonePrunedWrapper(
+              _trans_model,
+              lat_,
+              decoder.GetOptions().lattice_beam,
+              clat_,
+              decoder.GetOptions().det_opts))
+        KALDI_WARN << "Determinization finished earlier than the beam for "
+                  << "utterance " << utt_;
+      delete lat_;
+      lat_ = NULL;
+      // We'll write the lattice without acoustic scaling.
+      if (_acoustic_scale != 0.0)
+        fst::ScaleLattice(fst::AcousticLatticeScale(1.0 / _acoustic_scale), clat_);
+      if (clat_->NumStates() == 0) {
+        KALDI_WARN << "Empty lattice for utterance " << utt_;
+      } else {
+        _compact_lattice_writer.Write(utt_, *clat_);
+      }
+      delete clat_;
+      clat_ = NULL;
+    }
+
+    // Create an output tensors
     Tensor* word_output = NULL;
     auto word_output_shape = TensorShape({static_cast<int>(words.size())});
     OP_REQUIRES_OK(context, context->allocate_output(0, word_output_shape,
@@ -240,6 +285,11 @@ class KaldiDecodeOp : public OpKernel {
   bool _allow_partial;
   std::string _fst_in_filename;
   std::string _model_in_filename;
+  std::string _lattice_ark_file;
+  kaldi::TransitionModel _trans_model;
+  fst::VectorFst<fst::StdArc> _decode_fst;
+  kaldi::LatticeFasterDecoderConfig _config;
+  kaldi::CompactLatticeWriter _compact_lattice_writer;
 };
 
 REGISTER_KERNEL_BUILDER(Name("Decode").Device(DEVICE_CPU), KaldiDecodeOp);
@@ -277,7 +327,7 @@ REGISTER_OP("Fbank")
       // Assert an input vector
       TF_RETURN_IF_ERROR(c->WithRank(c->input(0), 1, &input));
       // The second dimension corresponds to the number of bins/filterbanks.
-      // The first dimension is the number of frames. This COULD be infered
+      // The first dimension is the number of frames. This COULD be inferred
       // but since the length is normally undefined anyway we leave it
       // unknown.
       int num_bins;
