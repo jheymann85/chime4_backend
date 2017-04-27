@@ -139,9 +139,9 @@ class KaldiDecodeOp : public OpKernel {
         msg << "Could not load transition model " << _model_in_filename;
         OP_REQUIRES(context, false, errors::Internal(msg.str()));
       }
-      _lattice_ark_file = "ark:" + _lattice_ark_file;
+
       if (!_lattice_ark_file.empty()) {
-        if (!_compact_lattice_writer.Open(_lattice_ark_file))
+        if (!_compact_lattice_writer.Open("ark:" + _lattice_ark_file))
         {
           KALDI_ERR << "Could not open table for writing lattices: "
                     << _lattice_ark_file;
